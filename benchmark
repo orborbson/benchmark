@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+export LC_ALL=C.UTF-8
+log_file="${PWD}/log_$(date +%F_%H-%M-%S).txt"
+test_dir="${PREFIX:-}/var/tmp/sysbench_test"
+pad="///////////////"
+
+pkg_check(){
+	if ! command -v sysbench &> /dev/null; then
+		echo "[!] sysbench: not installed" >&2
+		exit 1
+	fi
+	
+	if command -v stdbuf &>/dev/null; then
+		BENCH_CMD=(stdbuf -oL sysbench)
+	else
+		BENCH_CMD=(sysbench)
+	fi
+}
+
+sys_info(){
+	local hw_name="" os_name=""
+	if [[ -r /boot/dietpi/.hw_model ]]; then
+		hw_name=$(. /boot/dietpi/.hw_model; echo "${G_HW_MODEL_NAME}")
+	elif command -v getprop &> /dev/null; then
+		hw_name=$(getprop ro.product.model)
+		[[ -z "$hw_name" ]] && hw_name=$(getprop ro.vendor.product.model)
+	elif [[ -r /proc/device-tree/model ]]; then
+		hw_name=$(tr -d '\0' < /proc/device-tree/model)
+	else
+		hw_name=$(awk -F ': ' 'tolower($1)~/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null)
+	fi
+
+	if [[ -r /boot/dietpi/.version ]]; then
+		os_name=$(
+			. /boot/dietpi/.version 2>/dev/null
+			. /etc/os-release 2>/dev/null
+			echo "DietPi v${G_DIETPI_VERSION_CORE}.${G_DIETPI_VERSION_SUB}.${G_DIETPI_VERSION_RC} (${VERSION_CODENAME:-Linux})"
+		)
+	elif [[ -n "${TERMUX_VERSION:-}" ]]; then
+		os_name="Android $(getprop ro.build.version.release) (Termux ${TERMUX_VERSION})"
+	elif [[ -r /etc/os-release ]]; then
+		os_name=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-$NAME}")
+	else
+		os_name="$(uname -s) $(uname -r)"
+	fi
+
+	echo "# ${hw_name:-Unknown device} | ${os_name:-Linux}"
+	echo "# kernel: $(uname -r) ($(uname -m)) | dpkg: $(dpkg --print-architecture 2>/dev/null || echo 'n/a')"
+	echo "# $(sysbench --version 2>/dev/null)"
+}
+
+header() {
+	echo -e "\n\n${pad} ${1:-???} ${pad}\n"
+}
+
+bench(){
+	sleep 1
+	"${BENCH_CMD[@]}" "$@" | sed -u '1,2d'
+}
+
+cpu_test(){
+	header "CPU & STRESS"
+	bench cpu \
+		--cpu-max-prime=10000 \
+		--threads="$(nproc --all)" \
+		--report-interval=10 \
+		--time="${1:-121}" \
+		run
+}
+
+ramf(){
+	bench memory \
+		--memory-block-size="$3" \
+		--memory-total-size=100T \
+		--memory-scope=local \
+		--memory-access-mode="$1" \
+		--threads="$(nproc --all)" \
+		--time=10 \
+		--memory-oper="$2" \
+		run
+}
+
+ram_test(){
+	header "RAM: RANDOM READ"; ramf rnd read  16M
+	header "RAM: RANDOM WRITE"; ramf rnd write 16M
+	header "RAM: SEQ READ"; ramf seq read  8M
+	header "RAM: SEQ WRITE"; ramf seq write 8M
+}
+
+disk_test(){
+	local time_rnd="${1:-10}" time_seq="${2:-10}" sizef="${3:-512}M"
+	local direct_flag="--file-extra-flags=direct"
+
+	if ! mkdir -p "$test_dir" 2>/dev/null || ! pushd "$test_dir" &>/dev/null; then
+		echo -e "\n[!] not writable '$test_dir'" >&2
+		return 1
+	fi
+
+	if ! sysbench fileio --file-total-size=1M --file-num=1 --file-test-mode=seqwr --file-extra-flags=direct --events=1 run &>/dev/null; then
+		direct_flag=""
+		echo "[i] O_DIRECT not supported, using buffered I/O"
+	fi
+	rm -f -- test_file.*
+
+	header "DISK: PREPARING FILES"
+	if ! sysbench fileio --file-total-size="$sizef" prepare &>/dev/null; then
+		echo "[!] fileio prepare failed" >&2
+		return 1
+	fi
+	echo "Done (${sizef}iB)"
+
+	header "DISK: RANDOM R/W"
+	bench fileio \
+		--file-total-size="$sizef" \
+		--file-test-mode=rndrw \
+		--file-block-size=4K \
+		$direct_flag \
+		--file-fsync-freq=0 \
+		--file-fsync-end=off \
+		--time="$time_rnd" \
+		--events=0 \
+		run
+
+	header "DISK: SEQ READ"
+	bench fileio \
+		--file-total-size="$sizef" \
+		--file-test-mode=seqrd \
+		--file-block-size=4M \
+		$direct_flag \
+		--file-fsync-freq=0 \
+		--file-fsync-end=off \
+		--time="$time_seq" \
+		--events=0 \
+		run
+
+	header "DISK: SEQ REWRITE"
+	bench fileio \
+		--file-total-size="$sizef" \
+		--file-test-mode=seqrewr \
+		--file-block-size=4M \
+		$direct_flag \
+		--file-fsync-freq=0 \
+		--file-fsync-end=off \
+		--time="$time_seq" \
+		--events=0 \
+		run
+}
+
+summary(){
+	sleep 1
+	header "SUMMARY"
+	awk -v p="$pad" '
+	$0 ~ "^" p {
+		if ($0 ~ /CPU/) sec = "CPU"
+		else if ($0 ~ /RAM: RANDOM READ/) sec = "RAM_RND_R"
+		else if ($0 ~ /RAM: RANDOM WRITE/) sec = "RAM_RND_W"
+		else if ($0 ~ /RAM: SEQ READ/) sec = "RAM_SEQ_R"
+		else if ($0 ~ /RAM: SEQ WRITE/) sec = "RAM_SEQ_W"
+		else if ($0 ~ /DISK: RANDOM/) sec = "DISK_RND"
+		else if ($0 ~ /DISK: SEQ READ/) sec = "DISK_SEQ_R"
+		else if ($0 ~ /DISK: SEQ REWRITE/) sec = "DISK_SEQ_W"
+		else sec = ""
+	}
+
+	sec == "CPU" && /events per second:/ { cpu_eps = $4 " EPS" }
+
+	sec ~ /^RAM_/ && /transferred/ {
+		match($0, /\([0-9.]+ [KMG]?iB\/sec\)/)
+		if (RSTART) {
+			val = substr($0, RSTART+1, RLENGTH-2)
+			sub(/\/sec$/, "/s", val)
+			ram_speed[sec] = val
+		}
+	}
+
+	sec == "DISK_RND" && /read:/  { disk_rnd_r = $3 " " $4 " (" $2 ")" }
+	sec == "DISK_RND" && /write:/ { disk_rnd_w = $3 " " $4 " (" $2 ")" }
+	sec == "DISK_SEQ_R" && /read:/  { disk_seq_r = $3 " " $4 " (" $2 ")" }
+	sec == "DISK_SEQ_W" && /write:/ { disk_seq_w = $3 " " $4 " (" $2 ")" }
+
+	function row(name, res) {
+		printf "%-20s %s\n", name ":", (res ? res : "-")
+	}
+
+	END {
+		row("CPU (multi-core)", cpu_eps)
+		row("RAM (rnd read)", ram_speed["RAM_RND_R"])
+		row("RAM (rnd write)", ram_speed["RAM_RND_W"])
+		row("RAM (seq read)", ram_speed["RAM_SEQ_R"])
+		row("RAM (seq write)", ram_speed["RAM_SEQ_W"])
+		row("DISK (rnd read)", disk_rnd_r)
+		row("DISK (rnd write)", disk_rnd_w)
+		row("DISK (seq read)", disk_seq_r)
+		row("DISK (seq rewrite)", disk_seq_w)
+	}
+	' "$1"
+}
+
+cleanup() {
+	popd &>/dev/null || true
+	rm -rf -- "$test_dir"
+}
+
+on_int() {
+	echo -e "\n[!] quit" >&2
+	exit 130
+}
+
+main(){
+	sys_info
+	cpu_test
+	ram_test
+	disk_test
+}
+
+trap cleanup EXIT
+trap on_int INT TERM
+pkg_check
+main 2>&1 | tee "$log_file"
+summary "$log_file" | tee -a "$log_file"
